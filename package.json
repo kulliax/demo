@@ -1,0 +1,49 @@
+{
+  "name": "demo7956756756734",
+  "version": "0.1.0",
+  "description": "CAP plugin that caches SAP CSRF tokens per destination-backed remote service, injects them into outgoing requests, and refreshes them in the background before they expire.",
+  "keywords": [
+    "sap",
+    "cap",
+    "cds",
+    "csrf",
+    "cds-plugin"
+  ],
+  "license": "MIT",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "files": [
+    "lib",
+    "cds-plugin.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build",
+    "test": "vitest run",
+    "test.watch": "vitest",
+    "test.e2e": "vitest run --config vitest.e2e.config.ts"
+  },
+  "peerDependencies": {
+    "@sap/cds": "^10",
+    "@sap-cloud-sdk/http-client": "^4"
+  },
+  "peerDependenciesMeta": {
+    "@sap-cloud-sdk/http-client": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@cap-js/cds-types": "^0",
+    "@sap-cloud-sdk/http-client": "^4",
+    "@sap/cds": "^10",
+    "@sap/cds-dk": "^10",
+    "@types/node": "^24",
+    "typescript": "^6",
+    "vitest": "^4"
+  }
+}
