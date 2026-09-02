@@ -1,0 +1,47 @@
+@dataService = http://localhost:4005
+@shopService = http://localhost:4004
+
+### 1. Read products directly from the protected data-service - a safe method, no CSRF needed
+GET {{dataService}}/odata/v4/catalog/Products
+
+### 2. Try to place an order directly, without a CSRF token -> rejected with 403 + "Required"
+POST {{dataService}}/odata/v4/catalog/Orders
+Content-Type: application/json
+
+{
+  "product": "P01",
+  "quantity": 2
+}
+
+### 3. Fetch a CSRF token + session cookie directly from data-service. The "x-csrf-token" and
+### "set-cookie" response headers are picked up automatically by request 4 via request variables
+### (see https://github.com/Huachao/vscode-restclient#request-variables) - no copy/paste needed.
+# @name csrfFetch
+GET {{dataService}}/odata/v4/catalog
+x-csrf-token: Fetch
+
+### 4. Place an order directly, now with the token/cookie from request 3 -> 201 Created
+POST {{dataService}}/odata/v4/catalog/Orders
+Content-Type: application/json
+x-csrf-token: {{csrfFetch.response.headers.x-csrf-token}}
+Cookie: {{csrfFetch.response.headers.set-cookie}}
+
+{
+  "product": "P01",
+  "quantity": 2
+}
+
+### 5. Read products through shop-service - forwarded to data-service, still no CSRF needed
+GET {{shopService}}/odata/v4/shop/Products
+
+### 6. Place an order through shop-service. cds-csrf-cache injects the cached CSRF token itself -
+### no token/cookie handling needed here at all, unlike request 3+4 against data-service directly.
+### Run this a few times in a row and watch data-service's terminal: "issued a csrf token" is only
+### logged once, not on every call - that's the cache at work.
+POST {{shopService}}/odata/v4/shop/Orders
+Content-Type: application/json
+
+{
+  "product": "P01",
+  "quantity": 2
+}

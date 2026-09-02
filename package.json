@@ -1,6 +1,6 @@
 {
-  "name": "demo7956756756734",
-  "version": "0.1.0",
+  "name": "myfirstdemoprojectkulliax",
+  "version": "0.1.1",
   "description": "CAP plugin that caches SAP CSRF tokens per destination-backed remote service, injects them into outgoing requests, and refreshes them in the background before they expire.",
   "keywords": [
     "sap",
@@ -13,7 +13,7 @@
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",
   "files": [
-    "lib",
+    "lib/**/*.js",
     "cds-plugin.js",
     "README.md",
     "LICENSE"
@@ -21,12 +21,17 @@
   "engines": {
     "node": ">=22"
   },
+  "workspaces": [
+    "sample/data-service",
+    "sample/shop-service"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "prepublishOnly": "npm run build",
     "test": "vitest run",
     "test.watch": "vitest",
-    "test.e2e": "vitest run --config vitest.e2e.config.ts"
+    "test.e2e": "vitest run --config vitest.e2e.config.ts",
+    "sample:start": "concurrently -n data-service,shop-service -c blue,green -k \"npm run start --workspace sample/data-service\" \"npm run start --workspace sample/shop-service\""
   },
   "peerDependencies": {
     "@sap/cds": "^10",
@@ -43,6 +48,7 @@
     "@sap/cds": "^10",
     "@sap/cds-dk": "^10",
     "@types/node": "^24",
+    "concurrently": "^9",
     "typescript": "^6",
     "vitest": "^4"
   }

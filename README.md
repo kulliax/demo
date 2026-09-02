@@ -95,6 +95,12 @@ the very first request after startup (or after an unexpected rejection).
    `requires.<service>.csrf`, either `{ "url": "..." }` or `true`) picks up the cache automatically
    the next time the server starts.
 
+## Sample application
+
+[`sample/`](sample/) contains two minimal runnable CAP apps: a backend that requires a CSRF token
+for writes, and a consumer that talks to it using this plugin - see
+[`sample/README.md`](sample/README.md) for how to run them and what to look at.
+
 ## Configuration
 
 ### Per-service, via the existing `csrf` config

@@ -1,0 +1,9 @@
+{
+  "destinations": [
+    {
+      "name": "data-service",
+      "url": "http://localhost:4005",
+      "authentication": "NoAuthentication"
+    }
+  ]
+}

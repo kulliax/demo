@@ -89,16 +89,26 @@ function isCsrfRejection(error: unknown): boolean {
 
 /**
  * Attaches a {@link CsrfTokenCache} to a connected `cds.RemoteService`: caches the CSRF token
- * instead of letting CAP fetch a fresh one on every write (its csrf middleware - Cloud SDK or
- * native fetch alike - only skips its own preflight once `x-csrf-token` is already present on the
- * outgoing request), and retries once, with a fresh token, if the backend ever rejects the cached
- * one as expired.
+ * instead of letting CAP fetch a fresh one on every write, and retries once, with a fresh token, if
+ * the backend ever rejects the cached one as expired.
+ *
+ * Once attached, this cache becomes the sole owner of CSRF handling for the service: `srv.csrf` is
+ * cleared (after its `url`/`method`/etc. have been read) so CAP's own built-in per-request csrf
+ * middleware never runs for it. That middleware would otherwise still fire on every write regardless
+ * of the token this cache already put on the request - neither the SAP Cloud SDK nor (confirmed
+ * against `@sap/cds/libx/_runtime/remote/utils/fetchClient.js`) CAP's native-fetch client skips its
+ * own preflight just because `x-csrf-token` is already present. Left enabled, that preflight not
+ * only re-fetches (and often re-authenticates) a token this cache already has, it targets the
+ * request's own URL with a trailing slash (an S/4 redirect workaround) - against a plain CAP OData
+ * service that resolves to `<Entity>/`, which CAP's own generic parser can reject outright (e.g. a
+ * UUID-keyed entity like `Orders/` gets read as an incomplete key with an empty value).
  *
  * A service without a destination, without any `csrf` configuration, or with `csrf.cache: false`
  * (e.g. a `--with-mocks` stand-in used in dev/test) is left untouched - there is nothing to cache a
- * token for, or the config explicitly opted out. Called automatically by this package's
- * `cds-plugin.js` for every served remote service; only call it directly for a service the plugin's
- * auto-discovery does not reach (e.g. a service served in a separate process).
+ * token for, or the config explicitly opted out; CAP's own per-request csrf handling stays in charge
+ * for it, unchanged. Called automatically by this package's `cds-plugin.js` for every served remote
+ * service; only call it directly for a service the plugin's auto-discovery does not reach (e.g. a
+ * service served in a separate process).
  *
  * With `csrf.share` (or `options.share`) turned on, the service does not get a cache of its own but
  * joins the one shared by every other service on the same destination - one token fetch for all of
@@ -132,6 +142,11 @@ export function attachCsrfCache(srv: cds.RemoteService, options: AttachCsrfCache
             srv.name, describeSettings(csrfUrl, method, csrfConfig), createCache)
         : undefined
     const cache = shared?.cache ?? createCache()
+
+    // This cache now owns csrf handling for the service - see the function doc for why CAP's own
+    // built-in per-request preflight (which does not check for an already-present x-csrf-token
+    // header before running, on the SAP Cloud SDK or native-fetch client alike) must not also run.
+    internals.csrf = undefined
 
     srv.before("*", async (req: cds.Request) => {
         if (SAFE_METHODS.has((req.method ?? "").toUpperCase())) return

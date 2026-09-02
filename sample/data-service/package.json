@@ -1,0 +1,19 @@
+{
+  "name": "cds-csrf-cache-sample-data-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Demo CAP service that requires a CSRF token for every write - the protected backend ../shop-service talks to through cds-csrf-cache.",
+  "scripts": {
+    "start": "cds serve --port 4005"
+  },
+  "dependencies": {
+    "@sap/cds": "^10"
+  },
+  "devDependencies": {
+    "@sap/cds-dk": "^10",
+    "@cap-js/sqlite": "^3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
