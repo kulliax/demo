@@ -20,6 +20,15 @@ describe("sharedCsrfCacheKey", () => {
         expect(one).toBe(other)
     })
 
+    it("tells two inline destinations (credentials.url) apart, and matches equal ones whatever their key order", () => {
+        const one = sharedCsrfCacheKey({ destination: { name: "s4", url: "https://s4.example" } })
+        const same = sharedCsrfCacheKey({ destination: { url: "https://s4.example", name: "s4" } })
+        const other = sharedCsrfCacheKey({ destination: { name: "s4", url: "https://s4-qa.example" } })
+
+        expect(same).toBe(one)
+        expect(other).not.toBe(one)
+    })
+
     it("separates destinations, differing destinationOptions and groups", () => {
         const base = { destination: "s4-o2c-100", destinationOptions: { useCache: true } }
 

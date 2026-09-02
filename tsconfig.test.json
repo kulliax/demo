@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // The test suite runs on this package's own `engines.node` (>= 22), which has Promise.withResolvers.
+    "lib": ["ES2024"],
+    "declaration": false,
+    "declarationMap": false,
+    "rootDir": "."
+  },
+  "include": ["src/**/*", "test/**/*"]
+}

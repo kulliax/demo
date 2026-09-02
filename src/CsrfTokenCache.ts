@@ -7,6 +7,12 @@ export type CsrfToken = {
 
 export type CsrfTokenFetcher = () => Promise<CsrfToken>
 
+/**
+ * A token as the cache serves it: with the `Cookie` header for it already assembled, so that
+ * string is built once per fetched token instead of once per outgoing request.
+ */
+export type CachedCsrfToken = CsrfToken & { cookieHeader?: string }
+
 export type CsrfTokenCacheOptions = {
     /** How long a token stays valid on the backend, in seconds. S/4 defaults to 1800 (30 minutes). */
     validitySeconds?: number
@@ -16,7 +22,7 @@ export type CsrfTokenCacheOptions = {
     autoRefresh?: boolean
 }
 
-type CachedToken = CsrfToken & { expiresAt: number }
+type CachedToken = CachedCsrfToken & { expiresAt: number }
 
 /** Shared by every token-fetch implementation and by `attachCsrfCache`'s 403 detection, so the header name and its "Required" rejection value are spelled out exactly once. */
 export const CSRF_TOKEN_HEADER = "x-csrf-token"
@@ -47,9 +53,9 @@ const DEFAULT_BUFFER_SECONDS = Number(process.env.csrf_token_buffer_seconds ?? 6
  * background refresh attempt failed, and only fetches synchronously once that hard limit is hit.
  * Concurrent `getToken()` calls share a single in-flight fetch.
  *
- * Framework-agnostic by design: `fetchToken` can be backed by native `fetch` ({@link buildCsrfTokenFetcher})
- * or by a connected `cds.RemoteService`'s destination ({@link buildCapDestinationCsrfTokenFetcher}) -
- * the cache itself has no HTTP dependency.
+ * Framework-agnostic by design: the cache itself has no HTTP dependency at all, it only needs an
+ * async `fetchToken()`. {@link buildCapDestinationCsrfTokenFetcher} is the implementation this
+ * package ships, for a connected `cds.RemoteService`'s destination.
  */
 export class CsrfTokenCache {
     private readonly log: ReturnType<typeof cds.log>
@@ -74,7 +80,7 @@ export class CsrfTokenCache {
     }
 
     /** Returns a valid token, fetching (and caching) one first if necessary - and logs which of the two it was, so the cache's effect is visible in the request log. */
-    async getToken(): Promise<CsrfToken> {
+    async getToken(): Promise<CachedCsrfToken> {
         if (this.cached && this.cached.expiresAt > Date.now()) {
             this.log.debug(`csrf token taken from cache, valid until ${new Date(this.cached.expiresAt).toISOString()}`)
             return this.cached
@@ -94,7 +100,7 @@ export class CsrfTokenCache {
     }
 
     /** Shared by `getToken()` and the proactive refresh timer, so a request racing the timer joins the same fetch - and logs whether it started that fetch or joined a running one. */
-    private triggerRefresh(): Promise<CsrfToken> {
+    private triggerRefresh(): Promise<CachedCsrfToken> {
         if (this.pending) {
             this.log.debug("csrf token fetch already in flight, joining it")
             return this.pending
@@ -104,10 +110,10 @@ export class CsrfTokenCache {
         return this.pending = this.refresh().finally(() => { this.pending = undefined })
     }
 
-    private async refresh(): Promise<CsrfToken> {
+    private async refresh(): Promise<CachedCsrfToken> {
         const fetchedAt = Date.now()
         const token = await this.fetchToken()
-        this.cached = { ...token, expiresAt: fetchedAt + this.validitySeconds * 1000 }
+        this.cached = { ...token, cookieHeader: toCookieHeader(token.cookies), expiresAt: fetchedAt + this.validitySeconds * 1000 }
         this.log.info(`fetched a new csrf token, valid until ${new Date(this.cached.expiresAt).toISOString()}`)
         this.scheduleRefresh(fetchedAt)
         return this.cached

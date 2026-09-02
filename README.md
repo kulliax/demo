@@ -26,42 +26,53 @@ the very first request after startup (or after an unexpected rejection).
   - deduplicates concurrent callers into a single in-flight fetch,
   - exposes `invalidate()` for a caller that learns the token was rejected out of band.
 
-- **Two independent token-fetch implementations** plug into that cache, matching how the SAP Cloud
-  SDK and native `fetch` are already treated as separate paths elsewhere in this project - they are
-  never merged into one "smart" client:
-  - `buildCsrfTokenFetcher` (`src/csrfFetch.ts`) uses Node's native `fetch` directly against a plain
-    URL. It has no SAP Cloud SDK or CAP dependency and works against any plain HTTP(S) endpoint -
-    the piece to reach for outside of any CAP service.
-  - `buildCapDestinationCsrfTokenFetcher` (`src/capDestinationTokenFetcher.ts`) is what
-    `attachCsrfCache` uses for a connected `cds.RemoteService`. It does **not** hardcode a client:
-    it reuses CAP's own `shouldUseCloudSdk()` decision
-    (`@sap/cds/libx/_runtime/remote/utils/cloudSdkProvider.js`) - the same function
-    `cds.RemoteService` itself calls for every other request against that destination - and picks
-    the SAP Cloud SDK or CAP's own native-fetch executor accordingly. A BTP destination that routes
-    through Cloud Connector (on-premise) or requires a client certificate always resolves to the
-    Cloud SDK here too, for the same reason `cds.RemoteService` always uses it for that destination:
-    that connectivity configuration only resolves into an Axios/Node-`https.Agent` shape, which
-    native `fetch` (undici) cannot consume. Both `@sap/cds` internals this reaches into are
-    exported-but-undocumented; if a future `@sap/cds` release moves them, the require fails
-    gracefully and the fetcher tries the Cloud SDK first instead.
+- **`buildCapDestinationCsrfTokenFetcher`** (`src/capDestinationTokenFetcher.ts`) is the token fetch
+  that plugs into the cache: one preflight request carrying `x-csrf-token: Fetch` against
+  `csrf.url`, read back as token plus session cookie(s). Two details of it are deliberately copied
+  from CAP's own client and the Cloud SDK's csrf middleware, because the systems this plugin exists
+  for need both: the URL is tried with a trailing slash first and then without it (S/4 answers the
+  slashless variant with a redirect), and a token is accepted even from a non-2xx response - some
+  systems reject the preflight and hand out a usable token in the same breath. It also carries the
+  same two correlation headers CAP puts on every remote request, so a token fetch can be traced
+  together with the request that triggered it.
 
-  The SAP Cloud SDK itself stays optional throughout, exactly as it is for `@sap/cds` - a project
-  that only talks to plain/local destinations can run without `@sap-cloud-sdk/http-client` installed
-  at all. `@sap-cloud-sdk/http-client` is only ever `require()`'d lazily, at the point a token fetch
-  actually needs it, never as a static import; if it isn't installed, CAP's own `shouldUseCloudSdk()`
-  already says so (via its own `isCloudSdkInstalled()` check) and the token fetch goes through native
-  fetch instead - the plugin's `package.json` marks it an optional peer dependency accordingly.
+- **`src/capClients.ts`** answers the one question the fetch itself must not answer: *which* HTTP
+  client. It does **not** hardcode one, and it does not decide for itself either - it asks CAP's own
+  `shouldUseCloudSdk()` (`@sap/cds/libx/_runtime/remote/utils/cloudSdkProvider.js`), the same
+  function `cds.RemoteService` calls for every other request against that destination, and hands
+  back the SAP Cloud SDK or CAP's own native-fetch client (`fetchClient.js`) accordingly, letting
+  whichever one it is resolve the destination. Neither the rule nor the destination resolution
+  behind it (the `destinations` env var, Basic-auth headers, query parameters) is reimplemented
+  anywhere in this package: a rebuilt copy would be a second source of truth that drifts away from
+  CAP's silently. A BTP destination that routes through Cloud Connector (on-premise) or requires a
+  client certificate therefore lands on the Cloud SDK here too, for the same reason
+  `cds.RemoteService` always uses it for that destination: that connectivity configuration only
+  resolves into an Axios/Node-`https.Agent` shape, which native `fetch` (undici) cannot consume.
 
-- **`createCsrfFetch`** (`src/csrfFetch.ts`) wraps any fetch-compatible function so every mutating
-  request is armed with the cached token (and its session cookie), and retried exactly once with a
-  freshly fetched token if the backend answers `403` + `x-csrf-token: Required`. This half is fully
-  usable on its own, outside of CAP, against any endpoint reachable via native `fetch`.
+  The price is that both `@sap/cds` modules involved are exported-but-undocumented. If a future
+  `@sap/cds` release moves them, the require fails gracefully and the fetch uses the Cloud SDK - the
+  only client left once `shouldUseCloudSdk()` can no longer be asked - and
+  `test/capDestinationTokenFetcher.e2e.test.ts` fails loudly on the next upgrade that does so,
+  because it requires the same two paths itself. The client choice itself is a pure function
+  (`chooseExecutor`) of what could be loaded, which is what makes it testable without intercepting
+  a runtime `require()`.
+
+  The SAP Cloud SDK stays optional throughout, exactly as it is for `@sap/cds` - a project that only
+  talks to plain/local destinations can run without `@sap-cloud-sdk/http-client` installed at all,
+  and `shouldUseCloudSdk()` already returns `false` for those destinations (via its own
+  `isCloudSdkInstalled()` check). It is only ever `require()`'d lazily, at the point a token fetch
+  actually needs it, never as a static import; if it isn't installed where CAP would have used it,
+  the token fetch falls back to CAP's native client rather than failing - the plugin's
+  `package.json` marks it an optional peer dependency accordingly.
 
 - **`attachCsrfCache`** (`src/attachCsrfCache.ts`) is the CAP-specific glue for a `cds.RemoteService`:
   it registers a `before("*")` handler that injects the cached token/cookie into every non-safe
   (non-`GET`/`HEAD`) outgoing request, and wraps `send()` so a `403` CSRF rejection invalidates the
   cache and retries once. It reads the very same `csrf` config CAP itself reads
   (`.cdsrc.json`'s `requires.<service>.csrf`, a sibling of `credentials` - see Configuration below).
+  A service that also configures CAP's `csrfInBatch` gets the token on safe requests too, because an
+  auto-batched read goes out as an OData `$batch` **POST** - a write as far as the gateway's csrf
+  check is concerned, even though every request inside it is a `GET`.
 
 - **`src/sharedCsrfCaches.ts`** is the registry behind `csrf.share`: instead of one cache per service,
   every service on the same destination can be handed *one* `CsrfTokenCache`, so a single token
@@ -138,6 +149,11 @@ This plugin extends the very `csrf` object CAP itself already reads
 default: the fetch URL falls back to the service's `credentials.path`, and every plugin-only field
 falls back to its default.
 
+CAP's `csrfInBatch` (a sibling of `csrf`, not a field inside it) is taken over as well where it is
+set: an auto-batched read goes out as an OData `$batch` **POST**, which a gateway may well demand a
+token for even though every request inside it is a `GET`. The cache then injects its token into safe
+requests too, instead of leaving those batches to CAP's own per-request preflight.
+
 ### One token for several services on the same destination (`share`)
 
 By default every remote service keeps a token of its own - four services on `s4-o2c-100` mean four
@@ -180,6 +196,20 @@ participating services refreshes the token for all of them.
 Turn it on for everything at once - without touching each service - with the `csrf_token_share`
 environment variable below. A single service can still opt out again with `"share": false`.
 
+### One cached token per service, not per user
+
+A cached token belongs to the destination, not to the user whose request happened to trigger the
+fetch: the token preflight runs without a forwarded user token, so every request through the service
+presents the same token and the same session cookie. That is what makes caching worth anything at
+all, and it is exactly right for a destination that talks to the backend as a technical user - Basic
+authentication, or an OAuth client-credentials flow.
+
+It is the wrong model for a destination that gives every user their own backend session - principal
+propagation, `OAuth2SAMLBearerAssertion`, `forwardAuthToken` - where a token fetched for one user is
+not valid for the next, and the preflight itself cannot even be resolved without that user's token.
+Leave the cache off for those services (`"csrf": { "cache": false }`) and let CAP fetch a token per
+request, which is what it does for a service this plugin does not touch.
+
 ### Environment-wide defaults
 
 Used whenever a service's `csrf` config doesn't set the corresponding field:
@@ -206,43 +236,34 @@ service on its own cache even though its `csrf` config asks for a shared one. `r
 disposes every shared cache and empties the registry; tests that attach shared caches should call it
 between cases.
 
-## Using the native-fetch half directly
-
-Outside of any CAP service - e.g. a plain script or a non-CAP integration - the cache and the
-native-fetch adapter can be used standalone:
-
-```ts
-import { CsrfTokenCache, buildCsrfTokenFetcher, createCsrfFetch } from "cds-csrf-cache"
-
-const cache = new CsrfTokenCache(buildCsrfTokenFetcher("https://example.com/service/"))
-const protectedFetch = createCsrfFetch(cache)
-
-await protectedFetch("https://example.com/service/Entities", { method: "POST", body: "{}" })
-```
-
 ## Tests
 
 - `test/*.spec.ts` - unit tests (Vitest, run via `npm test`), covering the cache's timing
-  behavior (caching, proactive refresh, hard expiry, invalidate, concurrent dedup), the native-fetch
-  adapter, the CAP-client selection in `capDestinationTokenFetcher`, the shared-cache registry
-  (scope identity, first-one-wins, reset) in `sharedCsrfCaches`, and the CAP wiring (config
+  behavior (caching, proactive refresh, hard expiry, invalidate, concurrent dedup), the client
+  choice (`capClients`) and the preflight itself (`capDestinationTokenFetcher`), the shared-cache
+  registry (scope identity, first-one-wins, reset) in `sharedCsrfCaches`, and the CAP wiring (config
   parsing, header injection, retry-on-403, sharing) in `attachCsrfCache`.
-- `test/CsrfCache.e2e.test.ts` - an end-to-end test (run via `npm run test.e2e`) that exercises
-  `CsrfTokenCache` and `createCsrfFetch` against a real local HTTP server standing in for an S/4
-  gateway, over real sockets and real timers: caching across repeated requests, a timed proactive
-  refresh, and recovery from an out-of-band token rejection.
+- `test/capDestinationTokenFetcher.e2e.test.ts` - end-to-end tests (run via `npm run test.e2e`) with
+  no mocks or fakes at all: a real local HTTP server standing in for an S/4 gateway, the real
+  `destinations` convention, and both real clients - CAP's native-fetch client and
+  `@sap-cloud-sdk/http-client`. It also `require`s the two `@sap/cds` internals `capClients` depends
+  on, so a release that moves them fails here loudly instead of silently degrading to the Cloud SDK.
 
 ## Development
 
-- `npm run build` compiles `src/**/*.ts` to `lib/` (the shipped `main`/`types` entry point and what
-  `cds-plugin.js` requires at runtime) via `tsc`. `npm publish` runs it automatically
-  (`prepublishOnly`).
+- `npm run build` wipes `lib/` and compiles `src/**/*.ts` into it via `tsc` - the shipped
+  `main`/`types` entry point and what `cds-plugin.js` requires at runtime. The wipe matters: `tsc`
+  leaves output of deleted sources behind, and a stale module would otherwise be published. `npm
+  publish` runs the build automatically (`prepublishOnly`), and ships `lib/` (JavaScript,
+  declarations and maps) plus `src/`, so the maps resolve for anyone debugging into the package.
 - `npm test` / `npm run test.e2e` run straight against the TypeScript sources in `src/` via Vitest -
   no build needed for that.
+- `npm run lint` (ESLint, flat config in `eslint.config.mjs`) and `npm run typecheck` (`tsc` over
+  `src` *and* `test`, which `npm run build` does not cover) round out what CI runs on every push.
 
 ## Release
 
-`.github/workflows/publish.yml` runs the test suite (Node 22/24) on every push and pull request
+`.github/workflows/publish.yml` runs lint, typecheck and both test suites (Node 22/24) on every push and pull request
 against `main`, and additionally publishes to npm when a tag matching `v*.*.*` is pushed:
 
 1. Bump `version` in `package.json` (e.g. `npm version minor`, which also creates the matching git

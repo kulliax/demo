@@ -1,5 +1,6 @@
 import cds from "@sap/cds"
-import { CSRF_TOKEN_HEADER, CsrfTokenCache, CsrfTokenCacheOptions, isCsrfRequiredRejection, toCookieHeader } from "./CsrfTokenCache"
+import { CSRF_TOKEN_HEADER, CsrfTokenCache, CsrfTokenCacheOptions, isCsrfRequiredRejection } from "./CsrfTokenCache"
+import { describeDestination, DestinationRef } from "./capClients"
 import { buildCapDestinationCsrfTokenFetcher, CsrfPreflightMethod } from "./capDestinationTokenFetcher"
 import { acquireSharedCsrfCache } from "./sharedCsrfCaches"
 
@@ -62,9 +63,12 @@ function describeSettings(csrfUrl: string, method: CsrfPreflightMethod, csrfConf
 }
 
 type RemoteServiceInternals = {
-    destination?: string
+    /** A destination name, or the inline destination CAP builds from `credentials.url` - see {@link DestinationRef}. */
+    destination?: DestinationRef
     destinationOptions?: Record<string, unknown>
     csrf?: boolean | CsrfConfig
+    /** CAP's own `csrfInBatch` (a sibling of `csrf`, read in `Service.js`): whether an auto-batched read gets a csrf token too. */
+    csrfInBatch?: boolean | CsrfConfig
     path?: string
 }
 
@@ -124,6 +128,7 @@ export function attachCsrfCache(srv: cds.RemoteService, options: AttachCsrfCache
     }
 
     const destination = internals.destination
+    const destinationLabel = describeDestination(destination)
     const destinationOptions = internals.destinationOptions ?? {}
     const csrfUrl = csrfConfig.url
     const method = normalizeCsrfMethod(csrfConfig.method)
@@ -143,20 +148,28 @@ export function attachCsrfCache(srv: cds.RemoteService, options: AttachCsrfCache
         : undefined
     const cache = shared?.cache ?? createCache()
 
+    // CAP reads `csrfInBatch` instead of `csrf` for an auto-batched read (`Service.js`), which goes
+    // out as an OData `$batch` *POST* - a write as far as the gateway's csrf check is concerned, even
+    // though every request inside it is a GET. A service that configured it would otherwise keep
+    // CAP's own preflight for those batches, since the cache skips safe methods; so the cache takes
+    // that over too and injects the token into safe requests as well.
+    const injectOnSafeMethods = Boolean(internals.csrfInBatch)
+
     // This cache now owns csrf handling for the service - see the function doc for why CAP's own
     // built-in per-request preflight (which does not check for an already-present x-csrf-token
     // header before running, on the SAP Cloud SDK or native-fetch client alike) must not also run.
     internals.csrf = undefined
+    internals.csrfInBatch = undefined
 
     srv.before("*", async (req: cds.Request) => {
-        if (SAFE_METHODS.has((req.method ?? "").toUpperCase())) return
+        if (!injectOnSafeMethods && SAFE_METHODS.has((req.method ?? "").toUpperCase())) return
 
         try {
             const token = await cache.getToken()
             req.headers ??= {}
             req.headers[CSRF_TOKEN_HEADER] = token.token
-            const cookieHeader = toCookieHeader(token.cookies)
-            if (cookieHeader) req.headers["cookie"] = cookieHeader
+            // Assembled once per token by the cache, not once per request.
+            if (token.cookieHeader) req.headers["cookie"] = token.cookieHeader
         } catch (error) {
             LOG.warn("could not obtain a cached csrf token, letting the request go through without one", error)
         }
@@ -177,7 +190,7 @@ export function attachCsrfCache(srv: cds.RemoteService, options: AttachCsrfCache
     }) as any
 
     if (!shared) LOG.info(`csrf token cache attached to service '${srv.name}'`)
-    else if (shared.joined) LOG.info(`service '${srv.name}' joined the csrf token cache shared for destination '${destination}' (created by '${shared.owner}')`)
-    else LOG.info(`csrf token cache attached to service '${srv.name}', shared with every other service on destination '${destination}'`)
+    else if (shared.joined) LOG.info(`service '${srv.name}' joined the csrf token cache shared for destination '${destinationLabel}' (created by '${shared.owner}')`)
+    else LOG.info(`csrf token cache attached to service '${srv.name}', shared with every other service on destination '${destinationLabel}'`)
     return cache
 }

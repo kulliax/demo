@@ -1,129 +1,102 @@
 import cds from "@sap/cds"
-import { CSRF_TOKEN_HEADER, CsrfTokenFetcher, missingCsrfTokenError } from "./CsrfTokenCache"
+import { ClientResponse, DestinationRef, HttpExecutor, resolveExecutor, toDestinationRef } from "./capClients"
+import { CSRF_TOKEN_HEADER, CsrfToken, CsrfTokenFetcher, missingCsrfTokenError } from "./CsrfTokenCache"
 
 const LOG = cds.log("csrf-cache")
 
-type NativeFetchResponse = { data: unknown, headers: Record<string, string | string[] | undefined>, status: number }
-type CloudSdkResponse = { status: number, headers: Record<string, string | string[] | undefined> }
-
-/* eslint-disable no-unused-vars -- parameter names in these function-type signatures are documentation, not declarations */
-type CloudSdkExecutor = (destination: unknown, requestConfig: unknown) => Promise<CloudSdkResponse>
-
-export type CapInternals = {
-    shouldUseCloudSdk: (destination: unknown) => boolean
-    nativeFetch: (destination: unknown, requestConfig: unknown) => Promise<NativeFetchResponse>
-}
-/* eslint-enable no-unused-vars */
-
-/**
- * `cds.RemoteService` decides per request whether to route through the SAP Cloud SDK or Node's
- * native `fetch`, via `shouldUseCloudSdk()` in `@sap/cds/libx/_runtime/remote/utils/cloudSdkProvider.js`
- * (a BTP destination without a locally-resolvable URL, or with anything other than Basic/No auth,
- * always forces the Cloud SDK - that is what makes an on-premise/Cloud-Connector/mTLS destination
- * safe to call at all, since only the Cloud SDK resolves that connectivity configuration).
- *
- * `buildCapDestinationCsrfTokenFetcher` reuses that exact decision instead of hardcoding a client,
- * so the token fetch always goes through the same path CAP itself would pick for the real request
- * on this service. Neither module is part of `@sap/cds`'s public entry point - both are
- * internal-but-exported (`module.exports` on their own files, just not re-exported from `@sap/cds`'s
- * `index.js`), so a future `@sap/cds` release could move them without a deprecation notice.
- * `resolveCapInternals` isolates that risk: if the require ever fails, every caller falls back to
- * treating the SAP Cloud SDK as the only option - the same one CAP would use once `useCloudSdk`
- * can no longer be asked for.
- */
-let capInternals: CapInternals | null | undefined
-
-function resolveCapInternals(): CapInternals | null {
-    if (capInternals !== undefined) return capInternals
-
-    try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports -- must be a runtime require: not part of @sap/cds's public entry point, see the module comment above
-        const { shouldUseCloudSdk } = require("@sap/cds/libx/_runtime/remote/utils/cloudSdkProvider")
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const { executeHttpRequest: nativeFetch } = require("@sap/cds/libx/_runtime/remote/utils/fetchClient")
-        return capInternals = { shouldUseCloudSdk, nativeFetch }
-    } catch (error) {
-        LOG.warn("could not load @sap/cds's internal client-selection module, always trying the Cloud SDK first for csrf token fetches", error)
-        return capInternals = null
-    }
-}
-
-/**
- * The SAP Cloud SDK is an optional peer dependency, exactly as it is for `@sap/cds` itself
- * (`cloudSdkProvider.js`'s `getCloudSdk()`/`isCloudSdkInstalled()`): a project that only talks to
- * plain/local destinations can run without `@sap-cloud-sdk/http-client` installed at all, and
- * `shouldUseCloudSdk()` already returns `false` in that case. A static top-level import of the
- * package would defeat that - it fails at module load time regardless of whether this branch is
- * ever taken - so this, too, is a lazy, cached, failure-tolerant require.
- */
-let cloudSdkExecutor: CloudSdkExecutor | null | undefined
-
-function resolveCloudSdkExecutor(): CloudSdkExecutor | null {
-    if (cloudSdkExecutor !== undefined) return cloudSdkExecutor
-
-    try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const { executeHttpRequest } = require("@sap-cloud-sdk/http-client")
-        return cloudSdkExecutor = executeHttpRequest
-    } catch {
-        return cloudSdkExecutor = null
-    }
-}
-
-function firstCookie(setCookie: string | string[] | undefined): string[] {
-    if (!setCookie) return []
-    return Array.isArray(setCookie) ? setCookie : [setCookie]
-}
-
-function tokenFrom(headers: Record<string, unknown>, status: number, csrfUrl: string): { token: string, cookies: string[] } {
-    const token = headers[CSRF_TOKEN_HEADER]
-    if (status !== 200 || typeof token !== "string")
-        throw missingCsrfTokenError(csrfUrl, status)
-    return { token, cookies: firstCookie(headers["set-cookie"] as string | string[] | undefined) }
-}
-
+/** Verb for the token preflight - only `get`/`head` make sense for one, and CAP's own `csrf.method` allows exactly these. */
 export type CsrfPreflightMethod = "get" | "head"
 
-export type CapDestinationTokenFetcherOverrides = {
-    capInternals?: CapInternals | null
-    cloudSdkFetch?: CloudSdkExecutor | null
+/** One preflight attempt against a given URL, for {@link withSlashRetry} to repeat. */
+type PreflightAttempt = (url: string) => Promise<CsrfToken>
+
+/** Response headers are lowercased by both clients, but the Cloud SDK's own csrf middleware still reads them case-insensitively - so does this. */
+function headerValue(headers: Record<string, unknown>, name: string): unknown {
+    if (name in headers) return headers[name]
+    const key = Object.keys(headers).find(header => header.toLowerCase() === name)
+    return key === undefined ? undefined : headers[key]
+}
+
+function cookiesFrom(setCookie: unknown): string[] {
+    return [setCookie].flat().filter((cookie): cookie is string => typeof cookie === "string")
 }
 
 /**
- * Builds a {@link CsrfTokenFetcher} for a connected `cds.RemoteService`'s destination, letting CAP's
- * own `shouldUseCloudSdk()` decide between the SAP Cloud SDK and native `fetch` - see the module
- * comment above for why that decision must not be hardcoded to one client, and why the Cloud SDK
- * itself must stay optional. `overrides` exists so tests can supply fakes directly instead of
- * mocking a runtime `require()` of a deep `node_modules` path.
+ * Reads token and session cookie(s) out of a preflight response. The status only feeds the error
+ * message: a token is accepted whatever it is, because some SAP backends answer the preflight with
+ * a 4xx/5xx and still hand out a usable one - which CAP's own client (`_csrfPreflight` in
+ * `fetchClient.js`) and the Cloud SDK's csrf middleware both take from there on purpose. Only a
+ * response without any token is an error.
+ */
+function tokenFrom(response: ClientResponse, csrfUrl: string): CsrfToken {
+    const token = headerValue(response.headers, CSRF_TOKEN_HEADER)
+    if (typeof token !== "string" || !token) throw missingCsrfTokenError(csrfUrl, response.status)
+    return { token, cookies: cookiesFrom(headerValue(response.headers, "set-cookie")) }
+}
+
+/** A non-2xx preflight arrives as a thrown error carrying the response (`if (!response.ok) throw` in CAP's client, axios's default `validateStatus` in the Cloud SDK's) - which may still hold the token. */
+function responseOf(error: unknown): ClientResponse | undefined {
+    const response = (error as { response?: { status?: number, headers?: Record<string, unknown> } })?.response
+    if (!response?.headers) return undefined
+    return { status: response.status ?? 0, headers: response.headers }
+}
+
+/** The correlation headers CAP puts on every remote request (`Service.js`), so a token fetch can be traced together with the request that triggered it. A background refresh has no request context and sends none. */
+function correlationHeaders(): Record<string, string> {
+    const correlationId = cds.context?.id
+    return correlationId ? { "x-correlation-id": correlationId, "x-correlationid": correlationId } : {}
+}
+
+/** The preflight itself - written once, for whichever client `capClients.ts` picked. */
+async function preflight(execute: HttpExecutor, destinationRef: DestinationRef, method: string, url: string): Promise<CsrfToken> {
+    const requestConfig = { method, url, headers: { ...correlationHeaders(), [CSRF_TOKEN_HEADER]: "Fetch" } }
+
+    try {
+        return tokenFrom(await execute(destinationRef, requestConfig), url)
+    } catch (error) {
+        const rejected = responseOf(error)
+        if (!rejected || !headerValue(rejected.headers, CSRF_TOKEN_HEADER)) throw error
+        return tokenFrom(rejected, url)
+    }
+}
+
+/**
+ * S/4 answers a preflight whose URL is missing the trailing slash with a redirect (axios#3369), so
+ * CAP's own client (`_fetchCsrfToken`) and the Cloud SDK's csrf middleware (`makeCsrfRequests`)
+ * both try with the slash first and then without it. A fetcher that only ever tried one of the two
+ * would fail against exactly the systems this plugin exists for, so this does the same.
+ */
+async function withSlashRetry(attempt: PreflightAttempt, csrfUrl: string): Promise<CsrfToken> {
+    const withSlash = csrfUrl.endsWith("/") ? csrfUrl : `${csrfUrl}/`
+
+    try {
+        return await attempt(withSlash)
+    } catch (error) {
+        LOG.debug(`csrf token preflight against '${withSlash}' failed, retrying without the trailing slash`, error)
+        return attempt(csrfUrl.replace(/\/+$/, ""))
+    }
+}
+
+/**
+ * Builds a {@link CsrfTokenFetcher} for a connected `cds.RemoteService`'s destination. The client is
+ * neither hardcoded here nor chosen here: `capClients.ts` asks CAP's own `shouldUseCloudSdk()` and
+ * hands back the SAP Cloud SDK or CAP's own native-fetch client, whichever `cds.RemoteService` would
+ * use for a real request against that destination - see that module for why that decision must
+ * neither be hardcoded nor rebuilt, and why the Cloud SDK stays optional.
  */
 export function buildCapDestinationCsrfTokenFetcher(
-    destination: string,
+    destination: DestinationRef,
     destinationOptions: Record<string, unknown>,
     csrfUrl: string,
-    method: CsrfPreflightMethod = "get",
-    overrides: CapDestinationTokenFetcherOverrides = {}
+    method: CsrfPreflightMethod = "get"
 ): CsrfTokenFetcher {
-    const destinationRef = { destinationName: destination, ...destinationOptions }
-    const nativeMethod: "GET" | "HEAD" = method === "head" ? "HEAD" : "GET"
+    const destinationRef = toDestinationRef(destination, destinationOptions)
+    // Uppercase for both clients: CAP's native client compares `method` against 'GET'/'HEAD'
+    // literally, and axios (and with it the Cloud SDK) is case-insensitive - so one spelling serves both.
+    const httpMethod = method.toUpperCase()
 
     return async () => {
-        const internals = "capInternals" in overrides ? overrides.capInternals ?? null : resolveCapInternals()
-        // No way to ask CAP - default to trying the Cloud SDK first, same as when internals resolve fine and it turns out to be installed.
-        const useCloudSdk = internals ? internals.shouldUseCloudSdk(destination) : true
-
-        if (useCloudSdk) {
-            const cloudSdkFetch = "cloudSdkFetch" in overrides ? overrides.cloudSdkFetch ?? null : resolveCloudSdkExecutor()
-            if (cloudSdkFetch) {
-                const response = await cloudSdkFetch(destinationRef, { method, url: csrfUrl, headers: { [CSRF_TOKEN_HEADER]: "Fetch" } })
-                return tokenFrom(response.headers, response.status, csrfUrl)
-            }
-        }
-
-        if (internals) {
-            const response = await internals.nativeFetch(destinationRef, { method: nativeMethod, url: csrfUrl, headers: { [CSRF_TOKEN_HEADER]: "Fetch" } })
-            return tokenFrom(response.headers, response.status, csrfUrl)
-        }
-
-        throw new Error(`Could not fetch a CSRF token from ${csrfUrl}: neither the SAP Cloud SDK nor @sap/cds's native fetch client is available.`)
+        const execute = resolveExecutor(destination)
+        return await withSlashRetry(url => preflight(execute, destinationRef, httpMethod, url), csrfUrl)
     }
 }

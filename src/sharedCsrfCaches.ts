@@ -1,5 +1,6 @@
 import cds from "@sap/cds"
 import { CsrfTokenCache } from "./CsrfTokenCache"
+import { describeDestination, DestinationRef } from "./capClients"
 
 const LOG = cds.log("csrf-cache")
 
@@ -18,7 +19,7 @@ const LOG = cds.log("csrf-cache")
  * service's token isolated while the rest share one).
  */
 export type SharedCsrfCacheScope = {
-    destination: string
+    destination: DestinationRef
     destinationOptions?: Record<string, unknown>
     group?: string
 }
@@ -46,7 +47,7 @@ function stableStringify(value: unknown): string {
 
 /** The identity of a shared cache - see {@link SharedCsrfCacheScope} for why each part is in it. */
 export function sharedCsrfCacheKey(scope: SharedCsrfCacheScope): string {
-    return `${scope.destination}::${stableStringify(scope.destinationOptions ?? {})}::${scope.group ?? ""}`
+    return `${stableStringify(scope.destination)}::${stableStringify(scope.destinationOptions ?? {})}::${scope.group ?? ""}`
 }
 
 export type SharedCsrfCache = {
@@ -82,7 +83,7 @@ export function acquireSharedCsrfCache(
     if (existing) {
         if (!existing.members.includes(member)) existing.members.push(member)
         if (existing.settings !== settings)
-            LOG.warn(`service '${member}' joins the shared csrf token cache of destination '${scope.destination}' with different settings (${settings}) `
+            LOG.warn(`service '${member}' joins the shared csrf token cache of destination '${describeDestination(scope.destination)}' with different settings (${settings}) `
                 + `than its owner '${existing.owner}' (${existing.settings}); the owner's settings stay in effect`)
         return { cache: existing.cache, key, joined: true, owner: existing.owner }
     }

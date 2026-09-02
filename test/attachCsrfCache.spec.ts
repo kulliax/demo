@@ -11,12 +11,12 @@ import { resetSharedCsrfCaches } from "../src/sharedCsrfCaches"
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function fakeRemoteService(config: any) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any, no-unused-vars
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const handlers: Record<string, (req: any) => unknown> = {}
     const service = {
         name: "testService",
         ...config,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any, no-unused-vars
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         before: vi.fn((event: string, handler: (req: any) => unknown) => { handlers[event] = handler }),
         send: vi.fn().mockResolvedValue("ok"),
         __handlers: handlers
@@ -101,6 +101,16 @@ describe("attachCsrfCache", () => {
         expect(buildCapDestinationCsrfTokenFetcher).toHaveBeenCalledWith("s4-o2c-100", {}, "/service/", "get")
     })
 
+    it("passes an inline destination (credentials.url) through to the token fetcher as the object it is", () => {
+        // CAP puts an object on the service for a `credentials.url` remote service, not a name - see DestinationRef.
+        const destination = { name: "testService", url: "https://s4.example", username: "sap" }
+        const srv = fakeRemoteService({ destination, csrf: { url: "/service/" } })
+
+        expect(attachCsrfCache(srv)).toBeDefined()
+
+        expect(buildCapDestinationCsrfTokenFetcher).toHaveBeenCalledWith(destination, {}, "/service/", "get")
+    })
+
     it("passes destinationOptions through to the token fetcher", () => {
         const destinationOptions = { selectionStrategy: "alwaysProvider", useCache: true }
         const srv = fakeRemoteService({ destination: "s4-o2c-100", destinationOptions, csrf: { url: "/service/" } })
@@ -170,6 +180,24 @@ describe("attachCsrfCache", () => {
 
         expect(fetchToken).not.toHaveBeenCalled()
         expect(req.headers["x-csrf-token"]).toBeUndefined()
+    })
+
+    it("takes over CAP's csrfInBatch as well, injecting the token into safe requests too", async () => {
+        // An auto-batched read goes out as an OData `$batch` POST, so a gateway can demand a token
+        // for it - which is why CAP has a separate `csrfInBatch` switch for exactly those requests.
+        const fetchToken = vi.fn().mockResolvedValue({ token: "batch-token", cookies: [] })
+        vi.mocked(buildCapDestinationCsrfTokenFetcher).mockReturnValue(fetchToken)
+        const srv = fakeRemoteService({ destination: "s4-o2c-100", csrf: { url: "/service/" }, csrfInBatch: true })
+        attachCsrfCache(srv)
+
+        // CAP's own batch preflight is switched off with the rest, so nothing fetches twice.
+        expect(srv.csrfInBatch).toBeUndefined()
+
+        const req = { method: "GET", headers: {} as Record<string, string> }
+        await srv.__handlers["*"](req)
+
+        expect(req.headers["x-csrf-token"]).toBe("batch-token")
+        expect(fetchToken).toHaveBeenCalledOnce()
     })
 
     it("lets the request through without headers when the token fetch fails", async () => {

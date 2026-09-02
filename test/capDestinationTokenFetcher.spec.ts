@@ -1,103 +1,164 @@
-import { describe, expect, it, vi } from "vitest"
-import { buildCapDestinationCsrfTokenFetcher, CapInternals } from "../src/capDestinationTokenFetcher"
+import { afterEach, describe, expect, it, vi } from "vitest"
+import cds from "@sap/cds"
 
-/**
- * `buildCapDestinationCsrfTokenFetcher` normally resolves both the CAP client-selection module and
- * the (optional!) SAP Cloud SDK itself via a runtime `require()` (see the module's own comments for
- * why - `@sap/cds/libx/_runtime/remote/utils/*` is an internal-but-exported deep path, and the
- * Cloud SDK must stay lazy so a project without it installed never fails to even load this module).
- * Vitest's `vi.mock` does not reliably intercept that kind of dynamic `require()`, so these tests
- * pass fake `overrides` directly instead.
- */
-const fakeCapInternals = (shouldUseCloudSdk: boolean): CapInternals & { nativeFetch: ReturnType<typeof vi.fn> } => ({
-    shouldUseCloudSdk: () => shouldUseCloudSdk,
-    nativeFetch: vi.fn()
+// Only the client choice is faked - which client CAP picks is `capClients.spec.ts`'s subject, and
+// the real, unmocked resolution is `capDestinationTokenFetcher.e2e.test.ts`'s.
+vi.mock("../src/capClients", async importOriginal => ({
+    ...await importOriginal<typeof import("../src/capClients")>(),
+    resolveExecutor: vi.fn()
+}))
+
+import { resolveExecutor } from "../src/capClients"
+import { buildCapDestinationCsrfTokenFetcher } from "../src/capDestinationTokenFetcher"
+
+const preflightResponse = (headers: Record<string, unknown>, status = 200) => ({ status, headers })
+
+/** Installs the executor every preflight in this file runs through, and hands it back for assertions. */
+function client(...responses: (ReturnType<typeof preflightResponse> | Error)[]) {
+    const execute = vi.fn()
+    for (const response of responses)
+        if (response instanceof Error) execute.mockRejectedValueOnce(response)
+        else execute.mockResolvedValueOnce(response)
+    if (responses.length === 1 && !(responses[0] instanceof Error)) execute.mockResolvedValue(responses[0])
+    vi.mocked(resolveExecutor).mockReturnValue(execute)
+    return execute
+}
+
+const rejectionWith = (status: number, headers: Record<string, unknown>) =>
+    Object.assign(new Error(`Request failed with status code ${status}`), { response: { status, headers } })
+
+afterEach(() => {
+    vi.mocked(resolveExecutor).mockReset()
+    cds.context = undefined
 })
 
-describe("buildCapDestinationCsrfTokenFetcher", () => {
-    it("uses the Cloud SDK when shouldUseCloudSdk(destination) says so, letting CAP's own decision drive the client choice", async () => {
-        const capInternals = fakeCapInternals(true)
-        const cloudSdkFetch = vi.fn().mockResolvedValue({ status: 200, headers: { "x-csrf-token": "sdk-token", "set-cookie": "sap-usercontext=1; path=/" } })
+describe("buildCapDestinationCsrfTokenFetcher, the preflight request", () => {
+    it("fetches with the destination reference, an uppercase verb and the Fetch header", async () => {
+        const execute = client(preflightResponse({ "x-csrf-token": "token-1", "set-cookie": "sap-usercontext=1; path=/" }))
 
-        const result = await buildCapDestinationCsrfTokenFetcher("s4-o2c-100", { useCache: true }, "/service/", "get", { capInternals, cloudSdkFetch })()
+        const result = await buildCapDestinationCsrfTokenFetcher("s4-o2c-100", { useCache: true }, "/service/", "get")()
 
-        expect(cloudSdkFetch).toHaveBeenCalledExactlyOnceWith(
+        expect(execute).toHaveBeenCalledExactlyOnceWith(
             { destinationName: "s4-o2c-100", useCache: true },
-            { method: "get", url: "/service/", headers: { "x-csrf-token": "Fetch" } })
-        expect(capInternals.nativeFetch).not.toHaveBeenCalled()
-        expect(result).toEqual({ token: "sdk-token", cookies: ["sap-usercontext=1; path=/"] })
+            { method: "GET", url: "/service/", headers: { "x-csrf-token": "Fetch" } })
+        expect(result).toEqual({ token: "token-1", cookies: ["sap-usercontext=1; path=/"] })
     })
 
-    it("uses CAP's own native fetch when shouldUseCloudSdk(destination) says so", async () => {
-        const capInternals = fakeCapInternals(false)
-        capInternals.nativeFetch.mockResolvedValue({ status: 200, headers: { "x-csrf-token": "native-token", "set-cookie": "sap-usercontext=2; path=/" } })
-        const cloudSdkFetch = vi.fn()
+    it("uses HEAD when csrf.method asks for it, again uppercase", async () => {
+        const execute = client(preflightResponse({ "x-csrf-token": "token-1" }))
 
-        const result = await buildCapDestinationCsrfTokenFetcher("local-dest", {}, "/service/", "head", { capInternals, cloudSdkFetch })()
+        await buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service/", "head")()
 
-        expect(capInternals.nativeFetch).toHaveBeenCalledExactlyOnceWith(
-            { destinationName: "local-dest" },
-            { method: "HEAD", url: "/service/", headers: { "x-csrf-token": "Fetch" } })
-        expect(cloudSdkFetch).not.toHaveBeenCalled()
-        expect(result).toEqual({ token: "native-token", cookies: ["sap-usercontext=2; path=/"] })
+        expect(execute).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ method: "HEAD" }))
     })
 
-    it("falls back to native fetch when the Cloud SDK is not installed, even though CAP would otherwise have picked it", async () => {
-        const capInternals = fakeCapInternals(true)
-        capInternals.nativeFetch.mockResolvedValue({ status: 200, headers: { "x-csrf-token": "native-token" } })
+    it("hands an inline destination (credentials.url) over unwrapped", async () => {
+        const destination = { name: "S4bupa", url: "https://s4.example" }
+        const execute = client(preflightResponse({ "x-csrf-token": "token-1" }))
 
-        // cloudSdkFetch: null - the same "not installed" state resolveCloudSdkExecutor() reaches on a MODULE_NOT_FOUND.
-        const result = await buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service/", "get", { capInternals, cloudSdkFetch: null })()
+        await buildCapDestinationCsrfTokenFetcher(destination, {}, "/service/", "get")()
 
-        expect(capInternals.nativeFetch).toHaveBeenCalledOnce()
-        expect(result.token).toBe("native-token")
+        expect(execute).toHaveBeenCalledWith(destination, expect.anything())
     })
 
-    it("tries the Cloud SDK first when CAP's own client-selection module could not be loaded (capInternals: null)", async () => {
-        const cloudSdkFetch = vi.fn().mockResolvedValue({ status: 200, headers: { "x-csrf-token": "sdk-token" } })
+    it("carries the correlation headers of the request that triggered the fetch, the same two CAP sets", async () => {
+        cds.context = { id: "corr-42" } as unknown as typeof cds.context
+        const execute = client(preflightResponse({ "x-csrf-token": "token-1" }))
 
-        const result = await buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service/", "get", { capInternals: null, cloudSdkFetch })()
+        await buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service/", "get")()
 
-        expect(cloudSdkFetch).toHaveBeenCalledOnce()
-        expect(result.token).toBe("sdk-token")
+        expect(execute).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+            headers: { "x-correlation-id": "corr-42", "x-correlationid": "corr-42", "x-csrf-token": "Fetch" }
+        }))
     })
 
-    it("throws a clear error when neither CAP's client-selection module nor the Cloud SDK is available", async () => {
-        const fetcher = buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service/", "get", { capInternals: null, cloudSdkFetch: null })
+    it("sends no correlation headers at all for a background refresh, which has no request context", async () => {
+        const execute = client(preflightResponse({ "x-csrf-token": "token-1" }))
 
-        await expect(fetcher()).rejects.toThrow(/neither the sap cloud sdk nor/i)
+        await buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service/", "get")()
+
+        expect(execute).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+            headers: { "x-csrf-token": "Fetch" }
+        }))
     })
 
-    it("passes destinationOptions through unchanged, the same way CAP itself merges them into the destination reference", async () => {
-        const capInternals = fakeCapInternals(true)
-        const cloudSdkFetch = vi.fn().mockResolvedValue({ status: 200, headers: { "x-csrf-token": "t" } })
+    it("asks for the client on every fetch, the way cds.RemoteService re-decides it per request", async () => {
+        client(preflightResponse({ "x-csrf-token": "token-1" }))
+        const fetcher = buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service/", "get")
 
-        await buildCapDestinationCsrfTokenFetcher("s4-o2c-100", { selectionStrategy: "alwaysProvider" }, "/service/", "get", { capInternals, cloudSdkFetch })()
+        await fetcher()
+        await fetcher()
 
-        expect(cloudSdkFetch).toHaveBeenCalledWith(
-            { destinationName: "s4-o2c-100", selectionStrategy: "alwaysProvider" }, expect.anything())
+        expect(resolveExecutor).toHaveBeenCalledTimes(2)
+        expect(resolveExecutor).toHaveBeenCalledWith("s4-o2c-100")
     })
+})
 
+describe("buildCapDestinationCsrfTokenFetcher, reading the preflight response", () => {
     it("throws when the backend does not return a token", async () => {
-        const capInternals = fakeCapInternals(true)
-        const cloudSdkFetch = vi.fn().mockResolvedValue({ status: 200, headers: {} })
+        client(preflightResponse({}, 200))
 
-        await expect(buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service/", "get", { capInternals, cloudSdkFetch })()).rejects.toThrow(/csrf token/i)
+        await expect(buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service/", "get")()).rejects.toThrow(/csrf token/i)
     })
 
-    it("throws when the preflight response is not a 200", async () => {
-        const capInternals = fakeCapInternals(true)
-        const cloudSdkFetch = vi.fn().mockResolvedValue({ status: 502, headers: { "x-csrf-token": "irrelevant" } })
+    it("takes the token from a rejected preflight when the backend still sent one - CAP and the Cloud SDK both do", async () => {
+        // Both clients reject a non-2xx by throwing, with the response on the error; some SAP
+        // systems answer a preflight with 401/403 and hand out a usable token anyway.
+        client(rejectionWith(401, { "x-csrf-token": "token-from-401", "set-cookie": ["sap-usercontext=3; path=/"] }))
 
-        await expect(buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service/", "get", { capInternals, cloudSdkFetch })()).rejects.toThrow(/502/)
+        const result = await buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service/", "get")()
+
+        expect(result).toEqual({ token: "token-from-401", cookies: ["sap-usercontext=3; path=/"] })
+    })
+
+    it("surfaces the client's own error when a rejected preflight carries no token either", async () => {
+        const rejection = rejectionWith(502, { "content-type": "text/html" })
+        client(rejection, rejection)
+
+        await expect(buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service/", "get")())
+            .rejects.toThrow(/status code 502/)
+    })
+
+    it("reads the token header case-insensitively, as the Cloud SDK's own csrf middleware does", async () => {
+        client(preflightResponse({ "X-CSRF-Token": "cased-token", "Set-Cookie": "sap-usercontext=4; path=/" }))
+
+        const result = await buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service/", "get")()
+
+        expect(result).toEqual({ token: "cased-token", cookies: ["sap-usercontext=4; path=/"] })
     })
 
     it("returns no cookies when the response carries none", async () => {
-        const capInternals = fakeCapInternals(true)
-        const cloudSdkFetch = vi.fn().mockResolvedValue({ status: 200, headers: { "x-csrf-token": "sdk-token" } })
+        client(preflightResponse({ "x-csrf-token": "token-1" }))
 
-        const result = await buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service/", "get", { capInternals, cloudSdkFetch })()
+        const result = await buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service/", "get")()
 
         expect(result.cookies).toEqual([])
+    })
+})
+
+describe("buildCapDestinationCsrfTokenFetcher, trailing-slash retry", () => {
+    it("tries the csrf url with a trailing slash first, then without - the S/4 redirect workaround CAP and the Cloud SDK both implement", async () => {
+        const execute = client(new Error("redirected"), preflightResponse({ "x-csrf-token": "second-attempt-token" }))
+
+        const result = await buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/sap/opu/odata/sap/API_X", "get")()
+
+        expect(execute.mock.calls.map(([, config]) => (config as { url: string }).url))
+            .toEqual(["/sap/opu/odata/sap/API_X/", "/sap/opu/odata/sap/API_X"])
+        expect(result.token).toBe("second-attempt-token")
+    })
+
+    it("does not retry once the first attempt came back with a token", async () => {
+        const execute = client(preflightResponse({ "x-csrf-token": "first-attempt-token" }))
+
+        await buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service", "get")()
+
+        expect(execute).toHaveBeenCalledOnce()
+    })
+
+    it("surfaces the second attempt's error when both fail", async () => {
+        client(new Error("first attempt failed"), new Error("second attempt failed"))
+
+        await expect(buildCapDestinationCsrfTokenFetcher("s4-o2c-100", {}, "/service", "get")())
+            .rejects.toThrow(/second attempt failed/)
     })
 })
