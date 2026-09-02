@@ -4,16 +4,16 @@ Two small CAP apps that show `cds-csrf-cache` in action end to end:
 
 - **`data-service`** is the "protected backend": `CatalogService` requires a valid CSRF token for
   every write against `Orders` (reads, e.g. of `Products`, stay open), exactly like a real S/4
-  OData service. See [`data-service/srv/csrfProtection.js`](data-service/srv/csrfProtection.js) and
-  [`data-service/srv/server.js`](data-service/srv/server.js) for the (manual, framework-free) CSRF
+  OData service. See [`data-service/srv/csrfProtection.ts`](data-service/srv/csrfProtection.ts) and
+  [`data-service/srv/server.ts`](data-service/srv/server.ts) for the (manual, framework-free) CSRF
   handshake - CAP itself doesn't validate incoming CSRF tokens for you; see the main
   [README](../README.md) for why an App Router is the standard way to get this for free instead.
 - **`shop-service`** is the consumer: `ShopService` forwards to `CatalogService` over a
-  destination-backed remote service connection. `cds-csrf-cache` is picked up automatically via its
-  `cds-plugin.js` and fetches/caches the CSRF token `data-service` requires - nothing in
-  `shop-service` calls the plugin, or even knows CSRF is involved; see
-  [`shop-service/srv/shop-service.cds`](shop-service/srv/shop-service.cds), which is the entire
-  implementation.
+  destination-backed remote service connection - see
+  [`shop-service/srv/shop-service.ts`](shop-service/srv/shop-service.ts), the only handler code this
+  side needs. `cds-csrf-cache` is picked up automatically via its `cds-plugin.js` and
+  fetches/caches the CSRF token `data-service` requires - nothing in `shop-service` calls the
+  plugin, or even knows CSRF is involved.
 
 Static reference data (`Products`) lives in
 [`data-service/db/data/sample.data-Products.csv`](data-service/db/data/sample.data-Products.csv) -
@@ -52,15 +52,16 @@ callers never have to do that dance themselves.
 
 ## What to look at
 
-- [`data-service/srv/csrfProtection.js`](data-service/srv/csrfProtection.js) /
-  [`data-service/srv/server.js`](data-service/srv/server.js) - the whole "backend requires CSRF"
+- [`data-service/srv/csrfProtection.ts`](data-service/srv/csrfProtection.ts) /
+  [`data-service/srv/server.ts`](data-service/srv/server.ts) - the whole "backend requires CSRF"
   side, deliberately minimal (no `csurf`/App Router dependency) so it's easy to read end to end.
-- [`shop-service/srv/shop-service.cds`](shop-service/srv/shop-service.cds) - the whole consumer:
-  a plain projection onto the remote `CatalogService`, no custom handler code at all. CAP forwards
-  `CREATE`/`READ` on it to the remote service generically; `cds-csrf-cache`'s `before("*")` handler
-  (attached by this package's `cds-plugin.js` when `CatalogService` is served, per its `csrf` config
-  in [`shop-service/package.json`](shop-service/package.json)) injects the cached token/cookie into
-  that outgoing request.
+- [`shop-service/srv/shop-service.ts`](shop-service/srv/shop-service.ts) - the whole consumer: a
+  plain projection onto the remote `CatalogService`, forwarded generically (CAP doesn't auto-forward
+  CRUD for a pure projection onto a remote service, so this is the minimal handler it needs).
+  `cds-csrf-cache`'s `before("*")` handler (attached by this package's `cds-plugin.js` when
+  `CatalogService` is served, per its `csrf` config in
+  [`shop-service/package.json`](shop-service/package.json)) injects the cached token/cookie into
+  that outgoing request - nothing here calls the plugin directly.
 - [`shop-service/srv/external/CatalogService.cds`](shop-service/srv/external/CatalogService.cds) -
   a hand-written stand-in for `CatalogService`'s metadata; a real project gets this via
   `cds import <edmx>` against the actual remote service.

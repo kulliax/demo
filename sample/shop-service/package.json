@@ -4,14 +4,20 @@
   "private": true,
   "description": "Demo CAP service that talks to the CSRF-protected ../data-service through cds-csrf-cache, without handling CSRF itself.",
   "scripts": {
-    "start": "cds serve --port 4004"
+    "start": "cds serve --port 4004",
+    "watch": "cds watch --port 4004"
   },
   "dependencies": {
     "@sap/cds": "^10",
     "cds-csrf-cache": "file:../.."
   },
   "devDependencies": {
-    "@sap/cds-dk": "^10"
+    "@sap/cds-dk": "^10",
+    "@cap-js/cds-types": "^0.19.0",
+    "@types/express": "^5",
+    "@types/node": "^24",
+    "tsx": "^4",
+    "typescript": "^7"
   },
   "engines": {
     "node": ">=22"

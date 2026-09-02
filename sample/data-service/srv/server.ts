@@ -1,5 +1,6 @@
-const cds = require("@sap/cds")
-const { issueCsrfToken, requireCsrfToken } = require("./csrfProtection")
+import cds from "@sap/cds"
+import type { Application } from "express"
+import { issueCsrfToken, requireCsrfToken } from "./csrfProtection"
 
 /**
  * Requires a CSRF token for every write against CatalogService, the same protocol a real S/4
@@ -10,10 +11,10 @@ const { issueCsrfToken, requireCsrfToken } = require("./csrfProtection")
  * /Orders), so ordinary reads/writes against those entities are untouched and still handled by
  * CAP's generic providers - only the token handshake itself is intercepted here.
  */
-cds.on("bootstrap", app => {
+cds.on("bootstrap", (app: Application) => {
     app.head("/odata/v4/catalog", issueCsrfToken)
     app.get("/odata/v4/catalog", issueCsrfToken)
     app.post("/odata/v4/catalog/Orders", requireCsrfToken, (req, res, next) => next())
 })
 
-module.exports = cds.server
+export default cds.server

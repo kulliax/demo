@@ -1,6 +1,6 @@
-const cds = require("@sap/cds")
+import cds from "@sap/cds"
 
-module.exports = class ShopService extends cds.ApplicationService {
+export class ShopService extends cds.ApplicationService {
     async init() {
         const Catalog = await cds.connect.to("CatalogService")
 
@@ -9,7 +9,7 @@ module.exports = class ShopService extends cds.ApplicationService {
         // minimal handler it requires (see https://cap.cloud.sap/docs/guides/services/consuming-services#expose-remote-services).
         // cds-csrf-cache (attached automatically via its cds-plugin.js) injects the cached CSRF
         // token into the outgoing CREATE below - this handler never sees or handles CSRF itself.
-        this.on(["READ", "CREATE"], ["Products", "Orders"], req => Catalog.run(req.query))
+        this.on(["READ", "CREATE"], ["Products", "Orders"], (req: cds.Request) => Catalog.run(req.query))
 
         return super.init()
     }
